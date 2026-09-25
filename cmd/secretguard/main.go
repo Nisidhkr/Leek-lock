@@ -51,6 +51,7 @@ func buildRoot(cfg config.Config) *cobra.Command {
 func buildScan(cfg config.Config) *cobra.Command {
 	var repoPath string
 	var format string
+	var gitleaksBinary string
 
 	cmd := &cobra.Command{
 		Use:   "scan",
@@ -58,12 +59,16 @@ func buildScan(cfg config.Config) *cobra.Command {
 		Long: `Scan runs Gitleaks against the target repository, normalises findings,
 redacts secret values, and renders a clean report.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if gitleaksBinary != "" {
+				cfg.GitleaksBinary = gitleaksBinary
+			}
 			return runScan(cfg, repoPath, format)
 		},
 	}
 
 	cmd.Flags().StringVar(&repoPath, "repo", ".", "Path to the Git repository to scan")
 	cmd.Flags().StringVar(&format, "format", "terminal", "Output format: terminal or json")
+	cmd.Flags().StringVar(&gitleaksBinary, "gitleaks", "", "Path to the gitleaks binary (default: 'gitleaks' in PATH)")
 
 	return cmd
 }

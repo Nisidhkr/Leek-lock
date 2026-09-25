@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -48,18 +49,32 @@ func (g *GitleaksScanner) Scan(ctx context.Context, repoPath string) Result {
 		return Result{Error: fmt.Errorf("invalid repo path %q: %w", repoPath, err)}
 	}
 
-	// ── 3. Build the command — NO string concatenation ───────────────────────
-	//  gitleaks git --source <repo> --report-format json --exit-code 1
+	// ── 3. Create a temp file for the JSON report ────────────────────────────
+	// Gitleaks writes its JSON report to --report-path (a file).
+	// We use a temp file and read it after the scan completes.
+	reportFile, err := os.CreateTemp("", "secretguard-gitleaks-*.json")
+	if err != nil {
+		return Result{Error: fmt.Errorf("failed to create temp report file: %w", err)}
+	}
+	reportPath := reportFile.Name()
+	reportFile.Close() // gitleaks will write to it
+	defer os.Remove(reportPath)
+
+	// ── 4. Build the command — NO string concatenation ───────────────────────
+	//  gitleaks git <repo> --report-format json --report-path <tempfile>
 	//
+	//  In Gitleaks 8.x the repo path is a positional argument to `git`.
+	//  We write to a temp file and read it back — gitleaks does not support
+	//  writing JSON to stdout directly.
 	//  --exit-code 1 means gitleaks exits 1 when it finds secrets (default).
-	//  We handle the exit code ourselves below.
 	args := []string{
 		"git",
-		"--source", absRepo,
+		absRepo, // positional repo path
 		"--report-format", "json",
-		"--report-path", "stdout",
+		"--report-path", reportPath,
 		"--exit-code", "1",
 		"--no-banner",
+		"--log-level", "warn",
 	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, g.cfg.Timeout)
@@ -68,13 +83,12 @@ func (g *GitleaksScanner) Scan(ctx context.Context, repoPath string) Result {
 	//nolint:gosec // args are constructed from validated values, not user strings
 	cmd := exec.CommandContext(scanCtx, binary, args...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	runErr := cmd.Run()
 
-	// ── 4. Handle exit codes ─────────────────────────────────────────────────
+	// ── 5. Handle exit codes ─────────────────────────────────────────────────
 	if scanCtx.Err() != nil {
 		return Result{Error: ErrScanTimeout}
 	}
@@ -83,22 +97,30 @@ func (g *GitleaksScanner) Scan(ctx context.Context, repoPath string) Result {
 		exitCode := exitCodeOf(runErr)
 		switch exitCode {
 		case 1:
-			// Findings were detected — expected; parse stdout below.
+			// Findings were detected — expected; read report file below.
 		default:
 			// Gitleaks reported a genuine error.
 			// Do NOT forward stderr directly as it may contain secret content.
 			stderrText := sanitiseStderr(stderr.String())
-			if strings.Contains(strings.ToLower(stderrText), "not a git repository") ||
-				strings.Contains(strings.ToLower(stderrText), "no git history") ||
-				strings.Contains(strings.ToLower(stderrText), "does not exist") {
+			lower := strings.ToLower(stderrText)
+			if strings.Contains(lower, "not a git repository") ||
+				strings.Contains(lower, "no git history") ||
+				strings.Contains(lower, "does not exist") {
 				return Result{Error: ErrNotGitRepo}
 			}
 			return Result{Error: fmt.Errorf("gitleaks execution failed (exit %d): %s", exitCode, stderrText)}
 		}
 	}
 
-	// ── 5. Parse JSON output ─────────────────────────────────────────────────
-	rawJSON := stdout.Bytes()
+	// ── 6. Read and parse the JSON report file ───────────────────────────────
+	rawJSON, readErr := os.ReadFile(reportPath)
+	if readErr != nil {
+		// If gitleaks found no leaks it may not write the file at all.
+		if os.IsNotExist(readErr) {
+			return Result{Findings: nil}
+		}
+		return Result{Error: fmt.Errorf("failed to read gitleaks report: %w", readErr)}
+	}
 
 	findings, parseErr := normalizer.NormalizeGitleaks(rawJSON)
 	if parseErr != nil {
